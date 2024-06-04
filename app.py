@@ -1,4 +1,4 @@
-from diffusers import StableDiffusionImg2ImgPipeline
+from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
 import torch
 
 from everai.app import App, context, VolumeRequest
@@ -15,14 +15,15 @@ import io
 import PIL
 from io import BytesIO
 
-APP_NAME = 'stable-diffusion-v1-5-img2img'
+APP_NAME = 'stable-diffusion-v1-5'
 VOLUME_NAME = 'models--runwayml--stable-diffusion-v1-5'
 QUAY_IO_SECRET_NAME = 'your-quay-io-secret-name'
 HUGGINGFACE_SECRET_NAME = 'your-huggingface-secret-name'
 MODEL_NAME = 'runwayml/stable-diffusion-v1-5'
 CONFIGMAP_NAME = 'sd15-configmap'
 
-image_pipe = None
+txt2img_pipe = None
+img2img_pipe = None
 
 image = Image.from_registry(IMAGE, auth=BasicAuth(
         username=Placeholder(QUAY_IO_SECRET_NAME, 'username', kind='Secret'),
@@ -73,23 +74,64 @@ def prepare_model():
     huggingface_token = secret.get('token-key-as-your-wish')
 
     model_dir = volume.path
+    is_in_cloud = context.is_in_cloud
 
-    global image_pipe
-
-    image_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL_NAME,
-                                                                token=huggingface_token,
-                                                                cache_dir=model_dir,
-                                                                revision="fp16",
-                                                                torch_dtype=torch.float16, 
-                                                                low_cpu_mem_usage=False
-                                                                )   
+    global txt2img_pipe
+    global img2img_pipe
+    
+    txt2img_pipe = StableDiffusionPipeline.from_pretrained(MODEL_NAME,
+                                                        token=huggingface_token,
+                                                        cache_dir=model_dir,
+                                                        revision="fp16", 
+                                                        torch_dtype=torch.float16, 
+                                                        low_cpu_mem_usage=False,
+                                                        local_files_only=is_in_cloud
+                                                        )
+    
+    # The self.components property can be useful to run different pipelines with the same weights and configurations without reallocating additional memory.
+    # If you just want to use img2img pipeline, you should use StableDiffusionImg2ImgPipeline.from_pretrained below.
+    img2img_pipe = StableDiffusionImg2ImgPipeline(**txt2img_pipe.components)
+    #img2img_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL_NAME,
+    #                                                            token=huggingface_token,
+    #                                                            cache_dir=model_dir,
+    #                                                            revision="fp16",
+    #                                                            torch_dtype=torch.float16,
+    #                                                            low_cpu_mem_usage=False,
+    #                                                            local_files_only=is_in_cloud
+    #                                                            )
+       
     # only in prepare mode push volume
     # to save gpu time (redundant sha256 checks)
     if context.is_prepare_mode:
         context.volume_manager.push(VOLUME_NAME)
     else:
-        image_pipe.to("cuda")
+        if torch.cuda.is_available():
+            txt2img_pipe.to("cuda")
+            img2img_pipe.to("cuda")
+        elif torch.backends.mps.is_available():
+            mps_device = torch.device("mps")
+            txt2img_pipe.to(mps_device)
+            img2img_pipe.to(mps_device)
 
+# service entrypoint
+# api service url looks https://everai.expvent.com/api/routes/v1/stable-diffusion-v1-5/txt2img
+# for test local url is http://127.0.0.1:8866/txt2img
+@app.service.route('/txt2img', methods=['GET','POST'])
+def txt2img():    
+    if flask.request.method == 'POST':
+        data = flask.request.json
+        prompt = data['prompt']
+    else:
+        prompt = flask.request.args["prompt"]
+
+    pipe_out = txt2img_pipe(prompt)
+
+    image_obj = pipe_out.images[0]
+
+    byte_stream = io.BytesIO()
+    image_obj.save(byte_stream, format="PNG")
+
+    return Response(byte_stream.getvalue(), mimetype="image/png")
 
 # service entrypoint
 # api service url looks https://everai.expvent.com/api/routes/v1/stable-diffusion-v1-5/img2img
@@ -104,7 +146,7 @@ def img2img():
     init_image = PIL.Image.open(BytesIO(img)).convert("RGB")
     init_image = init_image.resize((768, 512))
 
-    pipe_out = image_pipe(prompt=prompt, image=init_image, strength=0.75, guidance_scale=7.5)
+    pipe_out = img2img_pipe(prompt=prompt, image=init_image, strength=0.75, guidance_scale=7.5)
 
     image_obj = pipe_out.images[0]
 
