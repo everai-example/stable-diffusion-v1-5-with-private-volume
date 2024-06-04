@@ -1,6 +1,6 @@
 from everai.image import Builder
 
-IMAGE = 'quay.io/mc_jones/stable-diffusion-v1-5-img2img:v0.0.1'
+IMAGE = 'quay.io/mc_jones/stable-diffusion-v1-5:v0.0.1'
 
 image_builder = Builder.from_dockerfile(
     'Dockerfile',
